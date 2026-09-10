@@ -6,21 +6,40 @@ import pyotp
 import os
 import json
 import time
+import base64
 
 BASE = "https://discord.com/api/v9"
 BOT_TOKEN = os.getenv("DISCORD_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Bildirim için
-CHECK_INTERVAL = 1.0        # Her 1 saniyede bir kontrol
-CLAIM_LOOP_DELAY = 0.5      # Boşa düşünce 0.5s'de bir tekrar dene
-MAX_CLAIM_ATTEMPTS = 20     # 0.5s x 20 = 10 saniye boyunca dene
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+CHECK_INTERVAL = 1.0
+CLAIM_LOOP_DELAY = 0.5
+MAX_CLAIM_ATTEMPTS = 20
+
+# Discord'un beklediği sabit super properties (base64 encoded JSON)
+SUPER_PROPERTIES = base64.b64encode(json.dumps({
+    "os": "Windows",
+    "browser": "Chrome",
+    "device": "",
+    "system_locale": "en-US",
+    "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "browser_version": "120.0.0.0",
+    "os_version": "10",
+    "referrer": "",
+    "referring_domain": "",
+    "referrer_current": "",
+    "referring_domain_current": "",
+    "release_channel": "stable",
+    "client_build_number": 250000,
+    "client_event_source": None
+}, separators=(",", ":")).encode()).decode()
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 DATA_FILE = "accounts.json"
-stop_flags = {}     # {user_id: bool}
-active_tasks = {}   # {user_id: [task, task, ...]}
+stop_flags = {}
+active_tasks = {}
 
 
 # ============ VERİ ============
@@ -43,8 +62,7 @@ accounts = load_accounts()
 
 # ============ WEBHOOK ============
 
-async def send_webhook(content: str, embed: discord.Embed = None, color: int = 0x5865F2):
-    """Webhook'a bildirim gönder."""
+async def send_webhook(content: str, embed: discord.Embed = None):
     if not WEBHOOK_URL:
         return
     payload = {"content": content}
@@ -242,7 +260,6 @@ class PanelView(discord.ui.View):
         user_id = str(interaction.user.id)
         stop_flags[user_id] = True
 
-        # Aktif task'leri iptal et
         for t in active_tasks.get(user_id, []):
             if not t.done():
                 t.cancel()
@@ -252,22 +269,35 @@ class PanelView(discord.ui.View):
         await send_webhook(f"⏹ İzleme durduruldu. Kullanıcı: {interaction.user}")
 
 
+# ============ HEADER YARDIMCISI ============
+
+def build_headers(token: str) -> dict:
+    """User token için doğru header setini döndür."""
+    return {
+        "Authorization": f"Bearer {token}",  # ← FIX: prefix eklendi
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36",
+        "X-Super-Properties": SUPER_PROPERTIES,
+        "X-Discord-Locale": "en-US",
+        "X-Discord-Timezone": "Europe/Istanbul",
+        "Origin": "https://discord.com",
+        "Referer": "https://discord.com/channels/@me",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+
 # ============ SNIPER MANTIĞI ============
 
 async def run_sniper(user, account_name, account_data, channel, user_id):
-    """Bir hesap için vanity URL'leri izle."""
     token = account_data["token"]
     totp_secret = account_data["totp_secret"]
     guild_id = account_data["guild_id"]
     vanities = account_data["vanities"]
 
-headers = {
-    "Authorization": f"Bearer {token}",  # ← User token için Bearer prefix'i
-    "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Origin": "https://discord.com",
-    "Referer": "https://discord.com/channels/@me"
-}
+    headers = build_headers(token)
 
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
     timeout = aiohttp.ClientTimeout(total=10)
@@ -277,7 +307,8 @@ headers = {
         try:
             async with session.get(f"{BASE}/users/@me") as r:
                 if r.status != 200:
-                    msg = f"❌ **{account_name}**: Token geçersiz ({r.status})"
+                    txt = await r.text()
+                    msg = f"❌ **{account_name}**: Token geçersiz ({r.status}) — {txt[:200]}"
                     await channel.send(msg)
                     await send_webhook(msg)
                     return
@@ -307,12 +338,9 @@ headers = {
                     break
 
                 check_count[vanity] += 1
-
-                # 1. kontrol
                 available = await check_vanity(session, vanity)
 
                 if available is True:
-                    # 2. kontrol (yanlış pozitif olmasın)
                     recheck = await check_vanity(session, vanity)
                     if recheck is not True:
                         continue
@@ -321,7 +349,6 @@ headers = {
                     await channel.send(msg)
                     await send_webhook(msg)
 
-                    # Mevcut vanity var mı? Varsa çekme
                     current = await get_guild_vanity(session, guild_id)
                     if current:
                         msg = f"⛔ **{account_name}**: Sunucuda zaten vanity var (`{current}`), atlanıyor."
@@ -329,15 +356,19 @@ headers = {
                         await send_webhook(msg)
                         continue
 
-                    # 0.5s aralıklarla hızlı alma denemesi
                     success = False
                     for attempt in range(1, MAX_CLAIM_ATTEMPTS + 1):
                         if stop_flags.get(user_id, False):
                             break
 
-                        success = await claim_vanity(session, guild_id, vanity, totp_secret)
+                        success, detail = await claim_vanity(
+                            session, guild_id, vanity, totp_secret, token
+                        )
                         if success:
                             break
+
+                        if attempt == 1:
+                            await channel.send(f"📡 İlk deneme detayı: {detail}")
 
                         await asyncio.sleep(CLAIM_LOOP_DELAY)
 
@@ -358,7 +389,7 @@ headers = {
                         stop_flags[user_id] = True
                         break
                     else:
-                        msg = f"❌ **{account_name}**: `{vanity}` {MAX_CLAIM_ATTEMPTS} denemede alınamadı."
+                        msg = f"❌ **{account_name}**: `{vanity}` {MAX_CLAIM_ATTEMPTS} denemede alınamadı. Son: {detail}"
                         await channel.send(msg)
                         await send_webhook(msg)
 
@@ -367,13 +398,12 @@ headers = {
                         await channel.send(f"⚠️ **{account_name}**: `{vanity}` kontrol hatası (devam)")
 
                 else:
-                    if check_count[vanity] % 60 == 0:  # ~1 dakikada bir log
+                    if check_count[vanity] % 60 == 0:
                         await channel.send(
                             f"🔍 **{account_name}**: `{vanity}` hala dolu. "
                             f"({check_count[vanity]} kontrol)"
                         )
 
-            # Her saniye başına kontrol
             await asyncio.sleep(CHECK_INTERVAL)
 
         await channel.send(f"⏹ **{account_name}** izleme bitti.")
@@ -387,6 +417,10 @@ async def get_guild_vanity(session, guild_id):
             if r.status == 200:
                 data = await r.json()
                 return data.get("code")
+            if r.status == 429:
+                data = await r.json()
+                await asyncio.sleep(data.get("retry_after", 1) + 0.1)
+                return await get_guild_vanity(session, guild_id)
             return None
     except Exception:
         return None
@@ -401,52 +435,62 @@ async def check_vanity(session, vanity):
                 return False
             if r.status == 429:
                 data = await r.json()
-                retry = data.get("retry_after", 1)
-                await asyncio.sleep(retry + 0.1)
+                await asyncio.sleep(data.get("retry_after", 1) + 0.1)
                 return await check_vanity(session, vanity)
             return None
     except Exception:
         return None
 
 
-async def claim_vanity(session, guild_id, vanity, totp_secret):
+async def claim_vanity(session, guild_id, vanity, totp_secret, token):
+    """
+    Vanity URL'yi almaya çalış.
+    Dönüş: (success: bool, detail: str)
+    """
     payload = {"code": vanity}
+    url = f"{BASE}/guilds/{guild_id}/vanity-url"
 
+    # 1) Önce normal dene
     try:
-        async with session.patch(f"{BASE}/guilds/{guild_id}/vanity-url", json=payload) as r:
+        async with session.patch(url, json=payload) as r:
             if r.status == 200:
-                return True
+                return True, "OK"
+
+            body = await r.text()
 
             if r.status == 429:
-                data = await r.json()
+                data = json.loads(body) if body else {}
                 retry = data.get("retry_after", 1)
                 await asyncio.sleep(retry + 0.1)
-                return await claim_vanity(session, guild_id, vanity, totp_secret)
+                return await claim_vanity(session, guild_id, vanity, totp_secret, token)
 
-            if r.status == 403:
-                text = await r.text()
-                if "mfa" in text.lower() or "2fa" in text.lower():
-                    # 2FA ile dene
-                    try:
-                        totp = pyotp.TOTP(totp_secret)
-                        mfa_code = totp.now()
-                    except Exception:
-                        return False
+            # 2FA / MFA gerekiyorsa
+            if r.status == 403 and ("mfa" in body.lower() or "2fa" in body.lower()):
+                # MFA header'larını hazırla (Authorization dahil!)
+                try:
+                    mfa_code = pyotp.TOTP(totp_secret).now()
+                except Exception as e:
+                    return False, f"TOTP hatası: {e}"
 
-                    mfa_headers = {
-                        "X-Discord-MFA-Authorization": mfa_code,
-                        "Content-Type": "application/json"
-                    }
-                    async with session.patch(
-                        f"{BASE}/guilds/{guild_id}/vanity-url",
-                        json=payload, headers=mfa_headers
-                    ) as r2:
-                        return r2.status == 200
-                return False
+                mfa_headers = build_headers(token).copy()
+                mfa_headers["X-Discord-MFA-Authorization"] = mfa_code
+                mfa_headers["Referer"] = f"https://discord.com/channels/{guild_id}/settings"
 
-            return False
-    except Exception:
-        return False
+                async with session.patch(url, json=payload, headers=mfa_headers) as r2:
+                    body2 = await r2.text()
+                    if r2.status == 200:
+                        return True, "OK (MFA)"
+                    if r2.status == 429:
+                        data = json.loads(body2) if body2 else {}
+                        await asyncio.sleep(data.get("retry_after", 1) + 0.1)
+                        return await claim_vanity(session, guild_id, vanity, totp_secret, token)
+                    return False, f"MFA {r2.status}: {body2[:200]}"
+
+            # Diğer hatalar
+            return False, f"{r.status}: {body[:200]}"
+
+    except Exception as e:
+        return False, f"Exception: {e}"
 
 
 # ============ SLASH COMMAND ============
