@@ -274,7 +274,7 @@ class PanelView(discord.ui.View):
 def build_headers(token: str) -> dict:
     """User token için doğru header setini döndür."""
     return {
-        "Authorization": f"Bearer {token}",  # ← FIX: prefix eklendi
+        "Authorization": f"{token}",  # ← FIX: prefix eklendi
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
