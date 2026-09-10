@@ -261,13 +261,13 @@ async def run_sniper(user, account_name, account_data, channel, user_id):
     guild_id = account_data["guild_id"]
     vanities = account_data["vanities"]
 
-    headers = {
-        "Authorization": token,
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Origin": "https://discord.com",
-        "Referer": "https://discord.com/channels/@me"
-    }
+headers = {
+    "Authorization": f"Bearer {token}",  # ← User token için Bearer prefix'i
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Origin": "https://discord.com",
+    "Referer": "https://discord.com/channels/@me"
+}
 
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
     timeout = aiohttp.ClientTimeout(total=10)
